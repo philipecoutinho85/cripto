@@ -1,16 +1,15 @@
 
 import time
+from datetime import datetime
 import pandas as pd
 import numpy as np
 import streamlit as st
-
-# ---- Lightweight ccxt import (installed via requirements.txt) ----
 import ccxt
 
-st.set_page_config(page_title="Sinal Cripto — Comprar ou Vender", layout="centered")
+st.set_page_config(page_title="Radar Binance — Melhores para Comprar/Vender", layout="wide")
 
-st.title("🟢🔴 Sinal Cripto — Comprar ou Vender")
-st.caption("Regras simples: Breakout + Volume + Tendência. SL/TP por ATR.")
+st.title("📡 Radar Binance — Melhores para **Comprar** e **Vender** agora")
+st.caption("Sinais simples e objetivos: Breakout + Volume + Tendência (VWAP/EMA20) + RSI. Níveis de SL/TP por ATR.")
 
 # ---------------- Helpers ----------------
 def rsi(series, period=14):
@@ -40,104 +39,158 @@ def vwap(df, length=20):
     vol = df["volume"]
     return (tp * vol).rolling(length).sum() / vol.rolling(length).sum()
 
-# ---------------- UI ----------------
-symbols_default = ["ADA/USDT", "SOL/USDT", "DOGE/USDT", "ETH/USDT", "BTC/USDT"]
-col1, col2 = st.columns(2)
-symbol = col1.selectbox("Par (Binance Spot)", symbols_default, index=0)
-timeframe = col2.selectbox("Timeframe", ["15m", "5m", "1h"], index=0)
-lookback = st.slider("Lookback do breakout (barras)", 10, 50, 20, 1)
-vol_mult = st.slider("Múltiplo de volume (x média)", 1.0, 3.0, 1.5, 0.1)
+@st.cache_data(ttl=120, show_spinner=False)
+def list_symbols(exchange_id="binance", quote="BRL"):
+    ex = ccxt.binance()
+    markets = ex.load_markets()
+    syms = []
+    for s, m in markets.items():
+        if m.get("spot") and m.get("active", True):
+            base = m.get("base", "")
+            q = m.get("quote", "")
+            if q == quote:
+                syms.append(s)
+    return sorted(list(set(syms)))
+
+@st.cache_data(ttl=60, show_spinner=False)
+def fetch_tickers_dict(quote="BRL"):
+    ex = ccxt.binance()
+    tickers = ex.fetch_tickers()
+    # Return dict filtered to quote
+    out = {}
+    for sym, t in tickers.items():
+        if sym.endswith("/" + quote):
+            out[sym] = t
+    return out
+
+@st.cache_data(ttl=60, show_spinner=False)
+def get_top_by_volume(quote="BRL", topn=50):
+    t = fetch_tickers_dict(quote)
+    if not t:
+        return []
+    # ccxt tickers may include 'quoteVolume' or 'baseVolume'
+    rows = []
+    for sym, d in t.items():
+        qv = d.get("quoteVolume") or 0.0
+        bv = d.get("baseVolume") or 0.0
+        rows.append((sym, float(qv), float(bv)))
+    df = pd.DataFrame(rows, columns=["symbol","quoteVolume","baseVolume"]).sort_values("quoteVolume", ascending=False)
+    return df["symbol"].head(topn).tolist()
+
+@st.cache_data(ttl=90, show_spinner=False)
+def load_ohlcv(symbol, timeframe="15m", limit=300):
+    ex = ccxt.binance()
+    ohlcv = ex.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
+    df = pd.DataFrame(ohlcv, columns=["timestamp","open","high","low","close","volume"])
+    df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms")
+    df.set_index("timestamp", inplace=True)
+    return df
+
+def compute_signals(df, lookback, vol_mult, rsi_thr):
+    d = df.copy()
+    d["RSI"] = rsi(d["close"], 14)
+    d["ATR"] = atr(d, 14)
+    d["VWAP"] = vwap(d, 20)
+    d["EMA20"] = d["close"].ewm(span=20, adjust=False).mean()
+
+    roll_high = d["high"].shift(1).rolling(lookback).max()
+    roll_low  = d["low"].shift(1).rolling(lookback).min()
+
+    vol_ok = d["volume"] > (d["volume"].rolling(lookback).mean() * vol_mult)
+    trend_ok = (d["close"] > d["VWAP"]) & (d["close"] > d["EMA20"])
+    rsi_ok = d["RSI"] > rsi_thr
+
+    breakout_up = d["close"] > roll_high
+    breakout_down = d["close"] < roll_low
+
+    d["BUY_SIGNAL"] = breakout_up & vol_ok & trend_ok & rsi_ok
+    # SELL / realizar: perda de força — fecha abaixo de EMA20 e abaixo do VWAP com RSI<50 e volume alto
+    d["SELL_SIGNAL"] = breakout_down | ((d["close"] < d["EMA20"]) & (d["close"] < d["VWAP"]) & (d["RSI"] < 50) & vol_ok)
+    return d
+
+def make_decision(last_row, atr_mult_sl, atr_mult_tp):
+    price = float(last_row["close"])
+    atr_val = float(last_row["ATR"])
+    sl = price - atr_mult_sl * atr_val
+    tp = price + atr_mult_tp * atr_val
+    if bool(last_row.get("BUY_SIGNAL", False)):
+        return "COMPRAR", price, sl, tp
+    if bool(last_row.get("SELL_SIGNAL", False)):
+        # Para quem está posicionado: sugestão é vender/realizar
+        # Mantemos SL/TP do ponto atual como guia inverso
+        return "VENDER/REALIZAR", price, price + atr_mult_sl * atr_val, price - atr_mult_tp * atr_val
+    return "ESPERAR", price, sl, tp
+
+# ---------------- Controls ----------------
+colA, colB, colC, colD = st.columns([1,1,1,1])
+quote = colA.selectbox("Moeda de cotação", ["BRL", "USDT"], index=0)
+timeframe = colB.selectbox("Timeframe", ["15m", "5m", "1h"], index=0)
+topn = int(colC.number_input("Quantos pares varrer (por volume)", min_value=10, max_value=250, value=60, step=10))
+lookback = st.slider("Lookback breakout (barras)", 10, 50, 20, 1)
+vol_mult = st.slider("Múltiplo de volume", 1.0, 3.0, 1.6, 0.1)
 rsi_thr = st.slider("RSI mínimo", 40, 60, 50, 1)
-atr_mult_sl = st.slider("ATR para Stop (x)", 0.5, 2.0, 1.0, 0.1)
-atr_mult_tp = st.slider("ATR para Take (x)", 1.5, 5.0, 3.0, 0.5)
+atr_mult_sl = st.slider("ATR p/ Stop (x)", 0.5, 2.0, 1.0, 0.1)
+atr_mult_tp = st.slider("ATR p/ Take (x)", 1.5, 5.0, 3.0, 0.5)
 
-with st.expander("Opcional: informe sua entrada para ver SL/TP e ação de saída"):
-    entry_price = st.number_input("Preço de entrada (deixe 0 se ainda não entrou)", min_value=0.0, value=0.0, step=0.0001, format="%.6f")
+st.write("🔎 Carregando universo e varrendo pares por volume…")
+universe = get_top_by_volume(quote=quote, topn=topn)
 
-# ---------------- Data ----------------
-st.write("Buscando dados da Binance…")
-ex = ccxt.binance()
-limit = 400
-ohlcv = ex.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
+if not universe:
+    st.error("Não consegui carregar os pares. Tente novamente em alguns segundos.")
+    st.stop()
 
-df = pd.DataFrame(ohlcv, columns=["timestamp","open","high","low","close","volume"])
-df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms")
-df.set_index("timestamp", inplace=True)
+st.success(f"Total de pares varridos: {len(universe)} ({quote})")
 
-# Indicators
-df["RSI"] = rsi(df["close"], 14)
-df["ATR"] = atr(df, 14)
-df["VWAP"] = vwap(df, 20)
-df["EMA20"] = df["close"].ewm(span=20, adjust=False).mean()
+# Scan
+progress = st.progress(0, text="Varrendo OHLCV e calculando sinais…")
+rows_buy = []
+rows_sell = []
 
-# Signals
-roll_high = df["high"].shift(1).rolling(lookback).max()
-vol_ok = df["volume"] > (df["volume"].rolling(lookback).mean() * vol_mult)
-trend_ok = (df["close"] > df["VWAP"]) & (df["close"] > df["EMA20"])
-rsi_ok = df["RSI"] > rsi_thr
-breakout = df["close"] > roll_high
+for i, sym in enumerate(universe, start=1):
+    try:
+        df = load_ohlcv(sym, timeframe=timeframe, limit=300)
+        d = compute_signals(df, lookback, vol_mult, rsi_thr)
+        last = d.iloc[-1]
+        action, price, sl, tp = make_decision(last, atr_mult_sl, atr_mult_tp)
 
-df["BUY_SIGNAL"] = breakout & vol_ok & trend_ok & rsi_ok
+        # Score para ranking (simples e transparente)
+        score = 0
+        if action == "COMPRAR":
+            score += 2
+            if last["close"] > last["VWAP"]: score += 1
+            if last["RSI"] > (rsi_thr + 5): score += 1
+            exp_rr = (tp - price) / max(price - sl, 1e-9)
+            rows_buy.append([sym, float(price), float(sl), float(tp), float(last["RSI"]), float(last["ATR"]), float(last["VWAP"]), round(exp_rr,2), score])
+        elif action == "VENDER/REALIZAR":
+            score += 2
+            if last["close"] < last["VWAP"]: score += 1
+            if last["RSI"] < 45: score += 1
+            rows_sell.append([sym, float(price), float(sl), float(tp), float(last["RSI"]), float(last["ATR"]), float(last["VWAP"]), score])
+    except Exception as e:
+        # Falha de API ou símbolo sem OHLCV
+        pass
+    progress.progress(i/len(universe), text=f"Varrendo… {i}/{len(universe)}")
 
-last = df.iloc[-1]
+progress.empty()
 
-price = float(last["close"])
-atr_val = float(last["ATR"])
-sl = price - atr_mult_sl * atr_val
-tp = price + atr_mult_tp * atr_val
+# Tables
+def fmt_money(x):
+    return f"{x:,.6f}".replace(",", "X").replace(".", ",").replace("X",".")
 
-st.metric("Preço atual", f"{price:,.6f}".replace(",", "X").replace(".", ",").replace("X","."))
-st.write(f"RSI: **{last['RSI']:.1f}** | ATR: **{atr_val:.6f}** | VWAP: **{last['VWAP']:.6f}** | EMA20: **{last['EMA20']:.6f}**")
-
-# ---------------- Decision Logic ----------------
-action = "ESPERAR"
-reason = "Condições incompletas."
-color = "gray"
-
-if bool(last["BUY_SIGNAL"]):
-    action = "COMPRAR"
-    reason = f"Breakout + Volume ({vol_mult}x) + Tendência (acima do VWAP/EMA20) + RSI>{rsi_thr}"
-    color = "green"
+if rows_buy:
+    df_buy = pd.DataFrame(rows_buy, columns=["Par","Preço","SL","TP","RSI","ATR","VWAP","R:R","Score"]).sort_values(["Score","R:R","RSI"], ascending=[False,False,False]).head(20)
+    df_buy["Preço"] = df_buy["Preço"].map(fmt_money); df_buy["SL"] = df_buy["SL"].map(fmt_money); df_buy["TP"] = df_buy["TP"].map(fmt_money); df_buy["VWAP"] = df_buy["VWAP"].map(fmt_money)
+    st.subheader("🟢 Top oportunidades de **COMPRA** agora")
+    st.dataframe(df_buy, use_container_width=True)
 else:
-    # if in position (entry provided), decide hold/sell
-    if entry_price > 0.0:
-        sl_from_entry = entry_price - atr_mult_sl * atr_val
-        tp_from_entry = entry_price + atr_mult_tp * atr_val
-        if price <= sl_from_entry:
-            action = "VENDER"
-            reason = "Preço atingiu Stop Loss calculado por ATR."
-            color = "red"
-        elif price >= tp_from_entry:
-            action = "REALIZAR LUCRO"
-            reason = "Preço atingiu Take Profit calculado por ATR."
-            color = "green"
-        elif price > entry_price and price > last["VWAP"]:
-            action = "MANTER"
-            reason = "Acima da entrada e do VWAP — manter até TP ou trailing."
-            color = "blue"
-        else:
-            action = "ESPERAR"
-            reason = "Sem breakout válido. Aguardar."
-            color = "gray"
+    st.info("Sem sinais fortes de COMPRA neste instante.")
 
-# Big badge (use triple single quotes inside code to avoid conflict in outer string)
-st.markdown(f'''
-<div style="text-align:center; padding:16px; border-radius:12px; background:#f6f6f6; border:1px solid #ddd;">
-  <div style="font-size:48px; font-weight:800; color:{{'green' if color=='green' else ('#d00' if color=='red' else ('#06c' if color=='blue' else '#666'))}};">
-    {action}
-  </div>
-  <div style="margin-top:6px; font-size:14px;">{reason}</div>
-</div>
-''', unsafe_allow_html=True)
+if rows_sell:
+    df_sell = pd.DataFrame(rows_sell, columns=["Par","Preço","SL (inverso)","TP (inverso)","RSI","ATR","VWAP","Score"]).sort_values(["Score","RSI"], ascending=[False,True]).head(20)
+    df_sell["Preço"] = df_sell["Preço"].map(fmt_money); df_sell["VWAP"] = df_sell["VWAP"].map(fmt_money)
+    st.subheader("🔴 Top oportunidades de **VENDA / REALIZAR** agora")
+    st.dataframe(df_sell, use_container_width=True)
+else:
+    st.info("Sem sinais fortes de VENDA neste instante.")
 
-# SL/TP suggestions (from current price)
-st.subheader("Níveis sugeridos (baseados no ATR)")
-colA, colB = st.columns(2)
-with colA:
-    st.write("**Stop Loss (SL)**")
-    st.code(f"{sl:.6f}")
-with colB:
-    st.write("**Take Profit (TP)**")
-    st.code(f"{tp:.6f}")
-
-st.caption("Dica: use ordens OCO/TP/SL na exchange para automatizar sua saída.")
+st.caption(f"Atualizado: {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC — Fonte: Binance via ccxt")
